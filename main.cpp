@@ -1,5 +1,6 @@
 /*
-
+VSenv Package Manager 1.1.0.2
+by dhjs0000
 */
 
 #define WIN32_LEAN_AND_MEAN
@@ -18,6 +19,7 @@
 #include <thread>
 #include <iostream>
 #include <set>
+#include <chrono>  // 新增：超时和重试
 
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -27,37 +29,161 @@ namespace fs = std::filesystem;
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
 
+/* ---------- 数据结构定义 ---------- */
+struct TunaEntry {
+    std::string name, url, sourceTag;
+};
+
 /* ---------- 日志 ---------- */
 static void LOG(const std::string& s) {
     std::ofstream log("C:\\Temp\\pm.log", std::ios::app);
-    log << "[pm] " << s << std::endl;
+    log << "[pm] " << std::chrono::system_clock::now().time_since_epoch().count() << " " << s << std::endl;
 }
 
-/* ---------- HTTP GET ---------- */
-static std::string HttpGet(const std::string& url) {
-    LOG("HTTP GET " + url);
-    std::string host, path;
-    if (url.starts_with("https://")) {
-        size_t p = url.find('/', 8);
-        host = url.substr(8, p - 8);
-        path = (p == std::string::npos) ? "/" : url.substr(p);
-    }
-    else return {};
-    HINTERNET hInt = InternetOpenA("VSenv-pm/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-    if (!hInt) return {};
-    HINTERNET hConn = InternetConnectA(hInt, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0);
-    if (!hConn) { InternetCloseHandle(hInt); return {}; }
-    HINTERNET hReq = HttpOpenRequestA(hConn, "GET", path.c_str(), nullptr, nullptr, nullptr, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
-    if (!hReq) { InternetCloseHandle(hConn); InternetCloseHandle(hInt); return {}; }
-    std::string body;
-    if (HttpSendRequestA(hReq, nullptr, 0, nullptr, 0)) {
-        char buf[4096]; DWORD read = 0;
-        while (InternetReadFile(hReq, buf, sizeof(buf), &read) && read)
+/* ---------- HTTP GET (增强版：自动重试+超时) ---------- */
+static std::string HttpGet(const std::string& url, int maxRetries = 3) {
+    // 移除URL末尾空格
+    std::string cleanUrl = url;
+    while (!cleanUrl.empty() && isspace(cleanUrl.back()))
+        cleanUrl.pop_back();
+
+    LOG("HTTP GET (重试次数=" + std::to_string(maxRetries) + "): " + cleanUrl);
+
+    for (int attempt = 0; attempt < maxRetries; ++attempt) {
+        if (attempt > 0) {
+            LOG("第" + std::to_string(attempt + 1) + "次重试...");
+            std::this_thread::sleep_for(std::chrono::seconds(1 * attempt)); // 指数退避
+        }
+
+        std::string host, path;
+        DWORD port = INTERNET_DEFAULT_HTTPS_PORT;
+        DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE;
+
+        if (cleanUrl.rfind("https://", 0) == 0) {
+            size_t p = cleanUrl.find('/', 8);
+            host = cleanUrl.substr(8, p - 8);
+            path = (p == std::string::npos) ? "/" : cleanUrl.substr(p);
+        }
+        else if (cleanUrl.rfind("http://", 0) == 0) {
+            size_t p = cleanUrl.find('/', 7);
+            host = cleanUrl.substr(7, p - 7);
+            path = (p == std::string::npos) ? "/" : cleanUrl.substr(p);
+            port = INTERNET_DEFAULT_HTTP_PORT;
+            flags = INTERNET_FLAG_RELOAD;
+        }
+        else {
+            LOG("不支持的协议: " + cleanUrl);
+            return {};
+        }
+
+        // 设置超时
+        HINTERNET hInt = InternetOpenA("VSenv-pm/1.2", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+        if (!hInt) {
+            LOG("InternetOpen 失败: " + std::to_string(GetLastError()));
+            continue;
+        }
+
+        // 设置连接超时
+        DWORD timeout = 30000; // 30秒
+        InternetSetOptionA(hInt, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+        InternetSetOptionA(hInt, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+        HINTERNET hConn = InternetConnectA(hInt, host.c_str(), port,
+            nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0);
+        if (!hConn) {
+            LOG("InternetConnect 失败: " + std::to_string(GetLastError()));
+            InternetCloseHandle(hInt);
+            continue;
+        }
+
+        HINTERNET hReq = HttpOpenRequestA(hConn, "GET", path.c_str(), nullptr, nullptr, nullptr, flags, 0);
+        if (!hReq) {
+            LOG("HttpOpenRequest 失败: " + std::to_string(GetLastError()));
+            InternetCloseHandle(hConn);
+            InternetCloseHandle(hInt);
+            continue;
+        }
+
+        // 添加请求头（模拟浏览器，避免被拦截）
+        const char* headers = "User-Agent: VSenv-pm/1.2 (Windows)\r\n";
+        HttpAddRequestHeadersA(hReq, headers, -1, HTTP_ADDREQ_FLAG_ADD);
+
+        if (!HttpSendRequestA(hReq, nullptr, 0, nullptr, 0)) {
+            DWORD error = GetLastError();
+            LOG("HttpSendRequest 失败: " + std::to_string(error));
+
+            // 特殊处理常见错误
+            switch (error) {
+            case 12031: LOG("连接被重置(12031)，可能是防火墙/GFW拦截"); break;
+            case 12029: LOG("无法连接服务器(12029)，请检查网络"); break;
+            case 12007: LOG("无法解析主机名(12007)，请检查DNS"); break;
+            }
+
+            InternetCloseHandle(hReq);
+            InternetCloseHandle(hConn);
+            InternetCloseHandle(hInt);
+            continue;
+        }
+
+        // 检查HTTP状态码
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (!HttpQueryInfoA(hReq, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+            &statusCode, &statusSize, nullptr)) {
+            LOG("无法获取状态码: " + std::to_string(GetLastError()));
+            InternetCloseHandle(hReq);
+            InternetCloseHandle(hConn);
+            InternetCloseHandle(hInt);
+            continue;
+        }
+
+        LOG("HTTP 状态码: " + std::to_string(statusCode));
+
+        if (statusCode == 301 || statusCode == 302 || statusCode == 307 || statusCode == 308) {
+            // 处理重定向
+            char newUrl[2048];
+            DWORD newUrlSize = sizeof(newUrl);
+            if (HttpQueryInfoA(hReq, HTTP_QUERY_LOCATION, newUrl, &newUrlSize, nullptr)) {
+                LOG("重定向到: " + std::string(newUrl));
+                InternetCloseHandle(hReq);
+                InternetCloseHandle(hConn);
+                InternetCloseHandle(hInt);
+                return HttpGet(newUrl, maxRetries - 1); // 递归处理重定向
+            }
+        }
+
+        if (statusCode != 200) {
+            LOG("HTTP 请求失败，状态码: " + std::to_string(statusCode));
+            InternetCloseHandle(hReq);
+            InternetCloseHandle(hConn);
+            InternetCloseHandle(hInt);
+            continue;
+        }
+
+        // 读取响应内容
+        std::string body;
+        char buf[4096];
+        DWORD read = 0;
+        while (InternetReadFile(hReq, buf, sizeof(buf), &read) && read) {
             body.append(buf, read);
+        }
+
+        InternetCloseHandle(hReq);
+        InternetCloseHandle(hConn);
+        InternetCloseHandle(hInt);
+
+        LOG("HTTP 成功，大小=" + std::to_string(body.size()));
+
+        if (body.empty()) {
+            LOG("警告: 响应内容为空");
+            continue; // 视为失败，重试
+        }
+
+        return body; // 成功返回
     }
-    InternetCloseHandle(hReq); InternetCloseHandle(hConn); InternetCloseHandle(hInt);
-    LOG("HTTP 完成，大小=" + std::to_string(body.size()));
-    return body;
+
+    LOG("所有重试均失败");
+    return {};
 }
 
 /* ---------- SHA256 ---------- */
@@ -77,7 +203,7 @@ static std::string FileSHA256(const fs::path& file) {
         std::vector<BYTE> hash(hashLen);
         if (BCryptFinishHash(hHash, hash.data(), hashLen, 0)) break;
         hashHex.reserve(hashLen * 2);
-        auto hex = "0123456789abcdef";
+        const char* hex = "0123456789abcdef";
         for (BYTE b : hash) { hashHex.push_back(hex[b >> 4]); hashHex.push_back(hex[b & 0xf]); }
     } while (0);
     if (hHash) BCryptDestroyHash(hHash);
@@ -92,7 +218,6 @@ static std::string GetSelfVersion() {
     HMODULE hMod = GetModuleHandleA("pm.dll");
     if (!hMod) return "0.0.0";
     VS_FIXEDFILEINFO* pFileInfo = nullptr; UINT len = 0;
-    void* pVer = nullptr;
     DWORD sz = GetFileVersionInfoSizeA("pm.dll", nullptr);
     if (!sz) return "0.0.0";
     std::vector<BYTE> buf(sz);
@@ -106,63 +231,42 @@ static std::string GetSelfVersion() {
     return ver;
 }
 
-/* ---------- 新增：读取所有 tuna 源 ---------- */
-struct TunaEntry { std::string name, url, sourceTag; };   // sourceTag 用于日志
-static std::vector<TunaEntry> LoadAllTunaSources() {
+/* ---------- 读取所有 tuna 源 ---------- */
+static std::vector<TunaEntry> LoadExtraTunaSources() {
     std::vector<TunaEntry> out;
-    auto add = [&](const std::string& body, const std::string& tag) {
-        std::istringstream in(body);
+
+    /* 1. 官方源 */
+    LOG("正在加载官方源...");
+    std::string official = HttpGet("https://dhjs0000.github.io/vsenv-plugins/tuna.txt");
+    if (!official.empty()) {
+        LOG("官方源原始内容大小: " + std::to_string(official.size()));
+        LOG("官方源前50字符: " + official.substr(0, 50));
+
+        std::istringstream in(official);
         std::string line;
+        int count = 0;
         while (std::getline(in, line)) {
             std::istringstream ln(line);
             std::string n, u; ln >> n >> u;
-            if (!n.empty() && !u.empty()) out.push_back({ n, u, tag });
+            if (!n.empty() && !u.empty()) {
+                out.push_back({ n, u, "official" });
+                count++;
+            }
         }
-        };
-
-    /* 1. 官方源 */
-    std::string official = HttpGet("https://dhjs0000.github.io/vsenv-plugins/tuna.txt");
-    if (!official.empty()) add(official, "official");
+        LOG("从官方源加载了 " + std::to_string(count) + " 条记录");
+    } else {
+        LOG("警告: 官方源返回为空或加载失败");
+    }
 
     /* 2. 用户自定义源 */
     char profile[MAX_PATH];
     SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, profile);
     fs::path srcDir = fs::path(profile) / ".vsenv" / "pm-sources.d";
     if (fs::exists(srcDir) && fs::is_directory(srcDir)) {
+        LOG("扫描用户自定义源目录: " + srcDir.string());
         for (const auto& ent : fs::directory_iterator(srcDir)) {
             if (!ent.is_regular_file() || ent.path().extension() != ".txt") continue;
-            std::ifstream fin(ent.path());
-            std::string body((std::istreambuf_iterator<char>(fin)),
-                std::istreambuf_iterator<char>());
-            if (!body.empty()) add(body, ent.path().filename().string());
-        }
-    }
-    LOG("共加载 " + std::to_string(out.size()) + " 条 tuna 记录");
-    return out;
-}
-
-static std::vector<TunaEntry> LoadExtraTunaSources() {
-    std::vector<TunaEntry> out;
-
-    /* 1. 官方源 */
-    std::string official = HttpGet("https://dhjs0000.github.io/vsenv-plugins/tuna.txt");
-    if (!official.empty()) {
-        std::istringstream in(official);
-        std::string line;
-        while (std::getline(in, line)) {
-            std::istringstream ln(line);
-            std::string n, u; ln >> n >> u;
-            if (!n.empty() && !u.empty()) out.push_back({ n, u, "official" });
-        }
-    }
-
-
-    char profile[MAX_PATH];
-    SHGetFolderPathA(nullptr, CSIDL_PROFILE, nullptr, 0, profile);
-    fs::path srcDir = fs::path(profile) / ".vsenv" / "pm-sources.d";
-    if (fs::exists(srcDir) && fs::is_directory(srcDir)) {
-        for (const auto& ent : fs::directory_iterator(srcDir)) {
-            if (!ent.is_regular_file() || ent.path().extension() != ".txt") continue;
+            LOG("加载用户源: " + ent.path().string());
             std::ifstream fin(ent.path());
             std::string body((std::istreambuf_iterator<char>(fin)),
                 std::istreambuf_iterator<char>());
@@ -174,9 +278,14 @@ static std::vector<TunaEntry> LoadExtraTunaSources() {
                 if (!n.empty() && !u.empty()) out.push_back({ n, u, ent.path().filename().string() });
             }
         }
+    } else {
+        LOG("用户自定义源目录不存在: " + srcDir.string());
     }
+
+    LOG("总计加载 " + std::to_string(out.size()) + " 条 tuna 记录");
     return out;
 }
+
 /* ---------- 业务：安装一个插件 ---------- */
 static bool PmInstall(const std::string& name, const std::string& mirrorUrl = {}) {
     LOG("开始安装插件: " + name + (mirrorUrl.empty() ? "" : "  镜像源=" + mirrorUrl));
@@ -187,21 +296,41 @@ static bool PmInstall(const std::string& name, const std::string& mirrorUrl = {}
     /* 1. 合并所有源（镜像优先） */
     std::vector<TunaEntry> sources;
     if (!mirrorUrl.empty()) {
+        LOG("优先加载镜像源: " + mirrorUrl);
         std::string body = HttpGet(mirrorUrl);
         if (body.empty()) {
-            std::cerr << "[pm] 无法拉取镜像源 " << mirrorUrl << '\n';
-            return false;
+            std::cerr << "[pm] 无法拉取镜像源 " << mirrorUrl << "，将继续尝试其他源\n";
+            LOG("镜像源加载失败");
+        } else {
+            LOG("镜像源加载成功，大小: " + std::to_string(body.size()));
+            std::istringstream in(body);
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream ln(line);
+                std::string n, u; ln >> n >> u;
+                if (!n.empty() && !u.empty()) sources.push_back({ n, u, "mirror" });
+            }
         }
-        std::istringstream in(body);
-        std::string line;
-        while (std::getline(in, line)) {
-            std::istringstream ln(line);
-            std::string n, u; ln >> n >> u;
-            if (!n.empty() && !u.empty()) sources.push_back({ n, u, "mirror" });
+    } else {
+        LOG("未指定镜像源");
+    }
+
+    auto extra = LoadExtraTunaSources();   // 含官方
+    LOG("从 LoadExtraTunaSources 获取到 " + std::to_string(extra.size()) + " 条记录");
+
+    sources.insert(sources.end(), extra.begin(), extra.end());
+
+    LOG("合并后总源数: " + std::to_string(sources.size()));
+
+    if (sources.empty()) {
+        std::cerr << "[pm] 警告: 没有任何源可用！\n";
+        LOG("错误: 源列表为空");
+    } else {
+        for (const auto& e : sources) {
+            std::cout << "[" << e.sourceTag << "] " << e.name << "  ->  " << e.url << '\n';
+            LOG("源条目: [" + e.sourceTag + "] " + e.name + " -> " + e.url);
         }
     }
-    auto extra = LoadExtraTunaSources();   // 含官方
-    sources.insert(sources.end(), extra.begin(), extra.end());
 
     /* 2. 找插件 + 打印选用地址 */
     std::string url;
@@ -210,8 +339,10 @@ static bool PmInstall(const std::string& name, const std::string& mirrorUrl = {}
     }
     if (url.empty()) {
         std::cerr << "[pm] 插件 " << name << " 不存在于任何源\n";
+        LOG("错误: 插件 " + name + " 未找到");
         return false;
     }
+    LOG("找到插件 URL: " + url);
 
     /* 3. 下载 */
     std::cout << "选用下载地址: " << url << '\n';
@@ -221,9 +352,11 @@ static bool PmInstall(const std::string& name, const std::string& mirrorUrl = {}
         std::string body = HttpGet(url);
         if (body.empty()) {
             std::cerr << "[pm] 下载失败，请检查网络或代理\n";
+            LOG("下载失败: " + url);
             return false;
         }
         std::ofstream(tmpVsep, std::ios::binary).write(body.data(), body.size());
+        LOG("下载成功，保存到: " + tmpVsep.string() + " 大小: " + std::to_string(body.size()));
     }
 
     /* 4. 解压 */
@@ -348,6 +481,7 @@ static bool PmInstall(const std::string& name, const std::string& mirrorUrl = {}
         << "[pm] 下次启动 VSenv 自动加载，无需重启电脑\n";
     return true;
 }
+
 /* ---------- 版本自检 + 冷更新 ---------- */
 static void CheckUpdateOnce() {
     const std::string self = GetSelfVersion();
@@ -396,7 +530,7 @@ static void CheckUpdateOnce() {
         if (ret == 0)
             std::cout << "[pm] 升级完成！请重新启动 VSenv 以加载新 pm 插件\n";
         else
-            std::cerr << "[pm] 升级失败，返回码 " << ret << "，请手动安装: " << tmpVsep.string() << "\n";
+            std::cerr << "[pm] 升级失败，返回码 " + std::to_string(ret) + "，请手动安装: " + tmpVsep.string() << "\n";
     }
     else {
         LOG("本地版本比远程版本新，无需更新");
@@ -418,6 +552,7 @@ static int CmdPm(int argc, char** argv) {
     }
     return PmInstall(name, mirror) ? 0 : 1;
 }
+
 extern "C" __declspec(dllexport)
 void RegisterCommands(std::unordered_map<std::string, std::function<int(int, char**)>>& tbl) {
     tbl["pm"] = CmdPm;
