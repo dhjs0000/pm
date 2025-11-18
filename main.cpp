@@ -1,5 +1,5 @@
 /*
-VSenv Package Manager 1.1.0.2
+VSenv Package Manager 1.1.0.3
 by dhjs0000
 */
 
@@ -238,6 +238,7 @@ static std::vector<TunaEntry> LoadExtraTunaSources() {
     /* 1. 官方源 */
     LOG("正在加载官方源...");
     std::string official = HttpGet("https://dhjs0000.github.io/vsenv-plugins/tuna.txt");
+    std::cout << "在所有源中看: https://dhjs0000.github.io/vsenv-plugins/tuna.txt \n"
     if (!official.empty()) {
         LOG("官方源原始内容大小: " + std::to_string(official.size()));
         LOG("官方源前50字符: " + official.substr(0, 50));
@@ -267,6 +268,7 @@ static std::vector<TunaEntry> LoadExtraTunaSources() {
         for (const auto& ent : fs::directory_iterator(srcDir)) {
             if (!ent.is_regular_file() || ent.path().extension() != ".txt") continue;
             LOG("加载用户源: " + ent.path().string());
+			std::cout << "在所有源中看: " << ent.path().string() << "\n";
             std::ifstream fin(ent.path());
             std::string body((std::istreambuf_iterator<char>(fin)),
                 std::istreambuf_iterator<char>());
